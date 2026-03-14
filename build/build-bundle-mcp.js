@@ -14,8 +14,6 @@ import {execSync} from 'child_process';
 import {createRequire} from 'module';
 
 import esbuild from 'esbuild';
-// @ts-expect-error: plugin has no types.
-import SoftNavPlugin from 'lighthouse-plugin-soft-navigation';
 
 import * as plugins from './esbuild-plugins.js';
 import {Runner} from '../core/runner.js';
@@ -85,11 +83,6 @@ function getMcpRequiredGathererNames() {
 const GIT_READABLE_REF =
   execSync(process.env.CI ? 'git rev-parse HEAD' : 'git describe').toString().trim();
 
-// HACK: manually include plugin audits.
-/** @type {Array<string>} */
-// @ts-expect-error
-const softNavAudits = SoftNavPlugin.audits.map(a => a.path);
-
 const today = (() => {
   const date = new Date();
   const year = new Intl.DateTimeFormat('en', {year: 'numeric'}).format(date);
@@ -152,12 +145,6 @@ async function buildBundle(entryPath, distPath) {
     '../computed/trace-engine-result.js',
   ];
 
-  // Include plugins.
-  dynamicModulePaths.push('lighthouse-plugin-soft-navigation');
-  softNavAudits.forEach(softNavAudit => {
-    dynamicModulePaths.push(softNavAudit);
-  });
-
   // Add all other audits and gatherers to dynamicModulePaths so they're in the bundledModules map.
   // They will be shimmed by lighthouseShimPlugin.
   allGatherers.forEach(gatherer => {
@@ -214,6 +201,7 @@ async function buildBundle(entryPath, distPath) {
     '@sentry/node',
     'source-map',
     'ws',
+    'puppeteer-core',
   ];
   for (const modulePath of modulesToIgnore) shimsObj[modulePath] = 'export default {}';
 
@@ -263,59 +251,7 @@ async function buildBundle(entryPath, distPath) {
     export const TraceEngineResultComputed = makeComputedArtifact(TraceEngineResult, null);
   `;
 
-  shimsObj['@paulirish/trace_engine'] = `
-    export const LanternComputationData = {};
-    export const Processor = {TraceProcessor: class {}};
-    export const Handlers = {ModelHandlers: {}};
-    export const Insights = {};
-    export const Helpers = {};
-  `;
-  shimsObj['@paulirish/trace_engine/models/trace/lantern/lantern.js'] = `
-    import * as Core from "./core/core.js";
-    import * as Graph from "./graph/graph.js";
-    import * as Metrics from "./metrics/metrics.js";
-    import * as Simulation from "./simulation/simulation.js";
-    import * as Types from "./types/types.js";
-    export {Core, Graph, Metrics, Simulation, Types};
-  `;
-  shimsObj['@paulirish/trace_engine/models/trace/lantern/core/core.js'] =
-    'export const NetworkAnalyzer = {analyze: () => ({}), findResourceForUrl: () => {}, ' +
-    'resolveRedirects: r => r, findMainResource: r => r[0]}; ' +
-    'export const LanternError = class extends Error {};';
-  shimsObj['@paulirish/trace_engine/models/trace/lantern/graph/graph.js'] =
-    'export const PageDependencyGraph = {getNetworkInitiators: () => []}; ' +
-    'export const BaseNode = {types: {NETWORK: "network", CPU: "cpu"}};';
-  shimsObj['@paulirish/trace_engine/models/trace/lantern/metrics/metrics.js'] = `
-    export class FirstContentfulPaint {}
-    export class Interactive {}
-    export class SpeedIndex {}
-    export class LargestContentfulPaint {}
-    export class FirstMeaningfulPaint {}
-    export class TotalBlockingTime {}
-    export class MaxPotentialFID {}
-    export const TBTUtils = {calculateSumOfBlockingTime: () => 0};
-  `;
-  shimsObj['@paulirish/trace_engine/models/trace/lantern/simulation/simulation.js'] = `
-    export const Constants = {
-      throttling: {
-        mobileSlow4G: {
-          rttMs: 150, throughputKbps: 1638.4, requestLatencyMs: 562.5,
-          downloadThroughputKbps: 1474.56, uploadThroughputKbps: 675, cpuSlowdownMultiplier: 4,
-        },
-        desktopDense4G: {
-          rttMs: 40, throughputKbps: 10240, cpuSlowdownMultiplier: 1,
-          requestLatencyMs: 0, downloadThroughputKbps: 0, uploadThroughputKbps: 0,
-        },
-      }
-    };
-    export class Simulator {
-      static createSimulator() { return new Simulator(); }
-      static get allNodeTimings() { return new Map(); }
-    }
-  `;
-  shimsObj['@paulirish/trace_engine/models/trace/lantern/types/types.js'] = 'export default {};';
-
-  await esbuild.build({
+  const result = await esbuild.build({
     entryPoints: [entryPath],
     outfile: distPath,
     write: false,
@@ -324,6 +260,7 @@ async function buildBundle(entryPath, distPath) {
     bundle: true,
     minify: false,
     treeShaking: true,
+    metafile: true,
     sourcemap: 'linked',
     platform: 'node',
     banner: {js: banner},
@@ -331,7 +268,6 @@ async function buildBundle(entryPath, distPath) {
     keepNames: true,
     inject: ['./build/process-global.js'],
     legalComments: 'inline',
-    external: ['debug', 'puppeteer-core'],
     alias: {
       'debug': require.resolve('debug/src/browser.js'),
       'lighthouse-logger': require.resolve('../lighthouse-logger/index.js'),
@@ -369,6 +305,78 @@ async function buildBundle(entryPath, distPath) {
       plugins.postprocess(),
     ],
   });
+  generateThirdPartyNotices(result.metafile);
+}
+
+/**
+ * @param {import('esbuild').BuildResult['metafile']} metafile
+ */
+function generateThirdPartyNotices(metafile) {
+  const paths = Object.keys(metafile?.inputs ?? {});
+  const nodeModules = new Map();
+  for (const path of paths) {
+    if (path.startsWith('replace-modules:')) {
+      continue;
+    }
+    const nodeModulesPathPart = 'node_modules/';
+    const nodeModulesPartIdx = path.lastIndexOf(nodeModulesPathPart);
+    if (nodeModulesPartIdx === -1) {
+      continue;
+    }
+    let nextPartIdx = path.indexOf('/', nodeModulesPartIdx + nodeModulesPathPart.length);
+    if (nextPartIdx === -1) {
+      nextPartIdx = path.length;
+    }
+    let nodeModulePath = path.substring(0, nextPartIdx);
+    let nodeModule = path.substring(nodeModulesPartIdx + nodeModulesPathPart.length, nextPartIdx);
+    // for org packages, like @x/y
+    if (nodeModule.startsWith('@')) {
+      let secondPartIdx = path.indexOf('/', nextPartIdx + 1);
+      if (secondPartIdx === -1) {
+        secondPartIdx = path.length;
+      }
+      nodeModulePath = path.substring(0, secondPartIdx);
+      nodeModule = path.substring(nodeModulesPartIdx + nodeModulesPathPart.length, secondPartIdx);
+    }
+    nodeModules.set(nodeModule, nodeModulePath);
+  }
+  const divider =
+              '\n\n-------------------- DEPENDENCY DIVIDER --------------------\n\n';
+
+  const stringifiedDependencies = Array.from(
+    nodeModules.keys()
+  ).map(name => {
+    const nodeModulePath = nodeModules.get(name);
+    const dependency = JSON.parse(
+      fs.readFileSync(path.join(nodeModulePath, 'package.json'), 'utf-8'));
+    const licenseFilePaths = [
+      path.join(nodeModulePath, 'LICENSE'),
+      path.join(nodeModulePath, 'LICENSE.txt'),
+      path.join(nodeModulePath, 'LICENSE.md'),
+    ];
+    for (const licenseFile of licenseFilePaths) {
+      if (fs.existsSync(licenseFile)) {
+        dependency.licenseText = fs.readFileSync(licenseFile, 'utf-8');
+        break;
+      }
+    }
+    const parts = [];
+    parts.push(`Name: ${dependency.name ?? 'N/A'}`);
+    let url = dependency.homepage ?? dependency.repository;
+    if (url) {
+      url = url.url;
+    }
+    parts.push(`URL: ${url ?? 'N/A'}`);
+    parts.push(`Version: ${dependency.version ?? 'N/A'}`);
+    parts.push(`License: ${dependency.license ?? 'N/A'}`);
+    if (dependency.licenseText) {
+      parts.push('');
+      parts.push(dependency.licenseText.replaceAll('\r', ''));
+    }
+    return parts.join('\n');
+  }).join(divider);
+
+  fs.writeFileSync('dist/LIGHTHOUSE_MCP_BUNDLE_THIRD_PARTY_NOTICES', stringifiedDependencies);
 }
 
 /**

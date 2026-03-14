@@ -859,6 +859,9 @@ export interface TraceEvent {
     frame?: string;
     name?: string;
     labels?: string;
+    feature?: string;
+    lineNumber?: number;
+    columnNumber?: number;
   };
   pid: number;
   tid: number;
