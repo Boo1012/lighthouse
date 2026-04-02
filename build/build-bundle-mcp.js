@@ -65,7 +65,7 @@ function getMcpRequiredGathererNames() {
   const bestPracticesArtifacts = [
     'DevtoolsLog', 'InspectorIssues', 'URL', 'ConsoleMessages', 'SourceMaps',
     'Scripts', 'Inputs', 'ImageElements', 'ViewportDimensions', 'Doctype',
-    'MainDocumentContent', 'MetaElements', 'Stacks',
+    'MainDocumentContent', 'MetaElements', 'Stacks', 'Trace',
   ];
   const a11yArtifacts = ['Accessibility'];
   for (const id of [...seoArtifacts, ...bestPracticesArtifacts, ...a11yArtifacts]) {
@@ -251,6 +251,8 @@ async function buildBundle(entryPath, distPath) {
     export const TraceEngineResultComputed = makeComputedArtifact(TraceEngineResult, null);
   `;
 
+  const inlinedFiles = new Set();
+
   const result = await esbuild.build({
     entryPoints: [entryPath],
     outfile: distPath,
@@ -294,7 +296,10 @@ async function buildBundle(entryPath, distPath) {
         disableUnusedError: true,
       }),
       plugins.bulkLoader([
-        plugins.partialLoaders.inlineFs({verbose: Boolean(process.env.DEBUG)}),
+        plugins.partialLoaders.inlineFs({
+          verbose: Boolean(process.env.DEBUG),
+          trackedFiles: inlinedFiles,
+        }),
         plugins.partialLoaders.rmGetModuleDirectory,
         plugins.partialLoaders.replaceText({
           '/* BUILD_REPLACE_BUNDLED_MODULES */': `[\n${bundledMapEntriesCode},\n]`,
@@ -305,47 +310,66 @@ async function buildBundle(entryPath, distPath) {
       plugins.postprocess(),
     ],
   });
-  generateThirdPartyNotices(result.metafile);
+
+  const mapFile = result.outputFiles?.find(file => file.path.endsWith('.js.map'));
+  const sourcemap = mapFile ? JSON.parse(mapFile.text) : {sources: []};
+  const distDir = path.dirname(path.resolve(process.cwd(), distPath));
+
+  generateThirdPartyNotices({
+    metafile: result.metafile,
+    sources: sourcemap.sources,
+    inlinedFiles,
+    distDir,
+  });
 }
 
 /**
- * @param {import('esbuild').BuildResult['metafile']} metafile
+ * @param {{
+ *   metafile: import('esbuild').Metafile,
+ *   sources: string[],
+ *   inlinedFiles: Set<string>,
+ *   distDir: string
+ * }} options
  */
-function generateThirdPartyNotices(metafile) {
-  const paths = Object.keys(metafile?.inputs ?? {});
+function generateThirdPartyNotices({metafile, sources, inlinedFiles, distDir}) {
+  const paths = new Set([
+    ...Object.keys(metafile.inputs),
+    ...sources.map(s => path.resolve(distDir, s)),
+    ...Array.from(inlinedFiles).map(s => path.resolve(distDir, s)),
+  ]);
   const nodeModules = new Map();
-  for (const path of paths) {
-    if (path.startsWith('replace-modules:')) {
-      continue;
+  for (let filePath of paths) {
+    if (filePath.startsWith('replace-modules:')) {
+      filePath = filePath.replace('replace-modules:', '');
     }
-    const nodeModulesPathPart = 'node_modules/';
-    const nodeModulesPartIdx = path.lastIndexOf(nodeModulesPathPart);
-    if (nodeModulesPartIdx === -1) {
-      continue;
-    }
-    let nextPartIdx = path.indexOf('/', nodeModulesPartIdx + nodeModulesPathPart.length);
-    if (nextPartIdx === -1) {
-      nextPartIdx = path.length;
-    }
-    let nodeModulePath = path.substring(0, nextPartIdx);
-    let nodeModule = path.substring(nodeModulesPartIdx + nodeModulesPathPart.length, nextPartIdx);
-    // for org packages, like @x/y
-    if (nodeModule.startsWith('@')) {
-      let secondPartIdx = path.indexOf('/', nextPartIdx + 1);
-      if (secondPartIdx === -1) {
-        secondPartIdx = path.length;
+
+    // Find the closest package.json
+    let dir = path.dirname(path.resolve(LH_ROOT, filePath));
+    let pkgJsonPath;
+    while (dir.startsWith(LH_ROOT) && dir !== LH_ROOT) {
+      const candidate = path.join(dir, 'package.json');
+      if (fs.existsSync(candidate)) {
+        pkgJsonPath = candidate;
+        break;
       }
-      nodeModulePath = path.substring(0, secondPartIdx);
-      nodeModule = path.substring(nodeModulesPartIdx + nodeModulesPathPart.length, secondPartIdx);
+      dir = path.dirname(dir);
     }
-    nodeModules.set(nodeModule, nodeModulePath);
+
+    if (pkgJsonPath) {
+      const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+      // We only care about third party packages (or workspace packages that aren't the root)
+      if (pkg.name && pkg.name !== 'lighthouse') {
+        nodeModules.set(pkg.name, path.dirname(pkgJsonPath));
+      }
+    }
   }
+
   const divider =
-              '\n\n-------------------- DEPENDENCY DIVIDER --------------------\n\n';
+               '\n\n-------------------- DEPENDENCY DIVIDER --------------------\n\n';
 
   const stringifiedDependencies = Array.from(
     nodeModules.keys()
-  ).map(name => {
+  ).sort().map(name => {
     const nodeModulePath = nodeModules.get(name);
     const dependency = JSON.parse(
       fs.readFileSync(path.join(nodeModulePath, 'package.json'), 'utf-8'));
@@ -353,6 +377,8 @@ function generateThirdPartyNotices(metafile) {
       path.join(nodeModulePath, 'LICENSE'),
       path.join(nodeModulePath, 'LICENSE.txt'),
       path.join(nodeModulePath, 'LICENSE.md'),
+      path.join(nodeModulePath, 'LICENSE.MIT'),
+      path.join(nodeModulePath, 'LICENSE.APACHE'),
     ];
     for (const licenseFile of licenseFilePaths) {
       if (fs.existsSync(licenseFile)) {
@@ -363,7 +389,7 @@ function generateThirdPartyNotices(metafile) {
     const parts = [];
     parts.push(`Name: ${dependency.name ?? 'N/A'}`);
     let url = dependency.homepage ?? dependency.repository;
-    if (url) {
+    if (url && typeof url === 'object') {
       url = url.url;
     }
     parts.push(`URL: ${url ?? 'N/A'}`);
